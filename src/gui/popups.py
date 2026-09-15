@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QFont, QTextFormat, QTextCursor, QKeySequence, QShortcut, QColor, QPainter
+from PyQt6 import sip
 
 from src import bot_registry
 from src.gui.commands import GUICommand, GUICommandType
@@ -235,24 +236,54 @@ def show_bot_publish_popup(ctx, bot_text):
     name_input = QLineEdit((metadata.get('name') or '').strip())
     name_input.setPlaceholderText(tl('bot_publish_name_hint'))
 
-    zone_row_widget = QWidget()
-    zone_row_layout = QHBoxLayout(zone_row_widget)
-    zone_row_layout.setContentsMargins(0, 0, 0, 0)
-    zone_row_layout.setSpacing(6)
+    zone_lbl = QLabel(tl('bot_publish_zone') + ' *')
     zone_input = QLineEdit((metadata.get('zone') or '').strip())
     zone_input.setPlaceholderText(tl('bot_publish_zone_hint'))
-    zone_row_layout.addWidget(zone_input, stretch=1)
+
+    zone_info_btn = None
     if 'readme' in getattr(ctx, 'svgs', {}):
         _readme_svg = ctx.svgs['readme']
         zone_info_btn = QPushButton()
         zone_info_btn.setIcon(ctx.titlebar_svg_icon(_readme_svg, 14))
-        zone_info_btn.setFixedSize(20, 20)
+        zone_info_btn.setFixedSize(18, 18)
         zone_info_btn.setStyleSheet(ctx.icon_btn_style)
         zone_info_btn.setToolTip(tl('bot_publish_zone_tip'))
         zone_info_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         if hasattr(ctx, 'tracked_icon_buttons'):
             ctx.tracked_icon_buttons.append((zone_info_btn, _readme_svg, 14))
-        zone_row_layout.addWidget(zone_info_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+    class _ZoneLabelWidget(QWidget):
+        def __init__(self, form_layout, lbl, btn=None, shift_right=3, parent=None):
+            super().__init__(parent)
+            self.form_layout = form_layout
+            self.lbl = lbl
+            self.btn = btn
+            self.shift_right = shift_right
+            self.lbl.setParent(self)
+            if self.btn is not None:
+                self.btn.setParent(self)
+
+        def sizeHint(self):
+            max_w = 0
+            for r in range(self.form_layout.rowCount()):
+                item = self.form_layout.itemAt(r, QFormLayout.ItemRole.LabelRole)
+                if item and item.widget() and item.widget() is not self:
+                    max_w = max(max_w, item.widget().sizeHint().width())
+            min_w = self.lbl.sizeHint().width() + (self.btn.sizeHint().width() if self.btn else 0)
+            h = max(self.lbl.sizeHint().height(), self.btn.sizeHint().height() if self.btn else 0)
+            return QSize(max(max_w, min_w), max(h, 24))
+
+        def resizeEvent(self, event):
+            h = self.height()
+            w = self.width()
+            lh = self.lbl.sizeHint().height()
+            self.lbl.setGeometry(0, (h - lh) // 2, self.lbl.sizeHint().width(), lh)
+            if self.btn is not None:
+                bw = self.btn.width()
+                bh = self.btn.height()
+                self.btn.setGeometry(w - bw + self.shift_right, (h - bh) // 2, bw, bh)
+
+    zone_label_widget = _ZoneLabelWidget(form, zone_lbl, zone_info_btn, shift_right=3)
 
     author_input = QLineEdit((metadata.get('author') or '').strip())
     format_input = QComboBox()
@@ -267,7 +298,7 @@ def show_bot_publish_popup(ctx, bot_text):
     description_input.setFixedHeight(72)
 
     form.addRow(tl('bot_publish_name') + ' *', name_input)
-    form.addRow(tl('bot_publish_zone') + ' *', zone_row_widget)
+    form.addRow(zone_label_widget, zone_input)
     form.addRow(tl('bot_publish_author') + ' *', author_input)
     form.addRow(tl('bot_publish_format'), format_input)
     form.addRow(tl('bot_publish_clients'), clients_input)
@@ -826,7 +857,46 @@ class CodeEditor(QTextEdit):
         painter.drawLine(gutter_w - 1, event.rect().top(), gutter_w - 1, event.rect().bottom())
 
 
-def show_bot_editor_popup(ctx, parent_editor, run_cb=None, kill_cb=None, set_running_cb=None, import_cb=None, export_cb=None, tl=None, mode='bot', toggle_logs_cb=None, initial_logs_expanded=False):
+class EditorDialog(QDialog):
+    """Custom QDialog for expanded windows that ensures clean close and lifecycle on ESC or close."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.find_replace_widget = None
+        self.close_find_replace_fn = None
+        self.cleanup_fn = None
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            if (self.find_replace_widget is not None 
+                    and not sip.isdeleted(self.find_replace_widget) 
+                    and self.find_replace_widget.isVisible()):
+                if self.close_find_replace_fn:
+                    self.close_find_replace_fn()
+                else:
+                    self.find_replace_widget.hide()
+                event.accept()
+                return
+            # Close dialog cleanly on ESC via close(), invoking closeEvent and all cleanup handlers
+            event.accept()
+            self.close()
+            return
+        super().keyPressEvent(event)
+
+    def reject(self):
+        # Override QDialog.reject() so default ESC or reject signals route through close()
+        # and always execute closeEvent and cleanup handlers.
+        self.close()
+
+    def closeEvent(self, event):
+        if self.cleanup_fn:
+            try:
+                self.cleanup_fn()
+            except Exception:
+                pass
+        super().closeEvent(event)
+
+
+def show_bot_editor_popup(ctx, parent_editor, run_cb=None, kill_cb=None, set_running_cb=None, import_cb=None, export_cb=None, tl=None, mode='bot', toggle_logs_cb=None, initial_logs_expanded=False, copy_logs_cb=None):
     """Opens a fully resizable, standalone Editor or Console Logs window with line numbers and shortcuts."""
     is_console = (mode == 'console')
     is_combat = (mode == 'combat')
@@ -843,12 +913,83 @@ def show_bot_editor_popup(ctx, parent_editor, run_cb=None, kill_cb=None, set_run
 
     win_title = ctx.tl(title_key) if ctx.tl(title_key) != title_key else default_title
 
-    dialog = QDialog(ctx.window)
+    dialog = EditorDialog(ctx.window)
     dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
     dialog.setWindowTitle(win_title)
     dialog.resize(850, 650)
     dialog.setMinimumSize(500, 380)
     dialog.setWindowFlags(Qt.WindowType.Window)
+
+    popup_tracked_icon_btns = []
+    orig_bot_export_set = None
+    synced_set_running = None
+    action_btn = None
+    orig_validate_cb = None
+    check_aid = 'validate_bot_script'
+    on_console_parent_changed = None
+    on_validate = None
+    _cleaned_up = [False]
+
+    def perform_cleanup(*args):
+        if _cleaned_up[0]:
+            return
+        _cleaned_up[0] = True
+
+        if is_console and on_console_parent_changed is not None:
+            try:
+                parent_editor.textChanged.disconnect(on_console_parent_changed)
+            except Exception:
+                pass
+
+        if not is_combat and not is_console and hasattr(ctx, 'exports') and 'bot' in ctx.exports:
+            try:
+                if synced_set_running is not None and ctx.exports['bot'].get('set_running') == synced_set_running:
+                    if orig_bot_export_set is not None:
+                        ctx.exports['bot']['set_running'] = orig_bot_export_set
+                    else:
+                        ctx.exports['bot'].pop('set_running', None)
+            except Exception:
+                pass
+
+        if hasattr(ctx, 'tracked_toggle_btns') and action_btn is not None:
+            try:
+                ctx.tracked_toggle_btns = [
+                    item for item in ctx.tracked_toggle_btns
+                    if item[0] is not action_btn and not sip.isdeleted(item[0])
+                ]
+            except Exception:
+                pass
+
+        if hasattr(ctx, 'tracked_icon_buttons') and popup_tracked_icon_btns:
+            try:
+                popup_btn_set = set(popup_tracked_icon_btns)
+                ctx.tracked_icon_buttons = [
+                    item for item in ctx.tracked_icon_buttons
+                    if item[0] not in popup_btn_set and not sip.isdeleted(item[0])
+                ]
+            except Exception:
+                pass
+
+        if orig_validate_cb is not None and hasattr(ctx, 'registry') and ctx.registry:
+            try:
+                if on_validate is not None and ctx.registry.callbacks.get(check_aid) == on_validate:
+                    ctx.registry.callbacks[check_aid] = orig_validate_cb
+            except Exception:
+                pass
+
+        if is_console:
+            attr_name = 'console_editor_dialog'
+        elif is_combat:
+            attr_name = 'combat_editor_dialog'
+        else:
+            attr_name = 'bot_editor_dialog'
+        try:
+            if getattr(ctx, attr_name, None) is dialog:
+                setattr(ctx, attr_name, None)
+        except Exception:
+            pass
+
+    dialog.cleanup_fn = perform_cleanup
 
     layout = QVBoxLayout(dialog)
     layout.setContentsMargins(0, 1, 0, 0)
@@ -878,13 +1019,19 @@ def show_bot_editor_popup(ctx, parent_editor, run_cb=None, kill_cb=None, set_run
             ctx.registry.make_bindable(btn, action_id)
         if hasattr(ctx, 'tracked_icon_buttons') and svg_content:
             ctx.tracked_icon_buttons.append((btn, svg_content, 26))
+            popup_tracked_icon_btns.append(btn)
         return btn
 
     if is_console:
         # CONSOLE TAB: Copy button and Collapse/Expand Logs button on the left, line numbers toggle (#) on the right.
         def _copy_logs():
-            import pyperclip
-            pyperclip.copy(parent_editor.toPlainText())
+            if copy_logs_cb:
+                copy_logs_cb()
+            elif hasattr(ctx, 'console_psg') and ctx.console_psg:
+                ctx.console_psg.copy()
+            else:
+                import pyperclip
+                pyperclip.copy(parent_editor.toPlainText())
 
         copy_btn = make_popup_icon_btn('copy_logs', ctx.tl('copy_logs'), _copy_logs, 'copy_logs')
         top_bar.addWidget(copy_btn)
@@ -909,6 +1056,7 @@ def show_bot_editor_popup(ctx, parent_editor, run_cb=None, kill_cb=None, set_run
             toggle_logs_popup_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             if hasattr(ctx, 'tracked_icon_buttons') and _initial_icon_svg:
                 ctx.tracked_icon_buttons.append((toggle_logs_popup_btn, _initial_icon_svg, 22))
+                popup_tracked_icon_btns.append(toggle_logs_popup_btn)
 
             def _on_popup_toggle_logs():
                 _popup_logs_expanded[0] = not _popup_logs_expanded[0]
@@ -952,6 +1100,7 @@ def show_bot_editor_popup(ctx, parent_editor, run_cb=None, kill_cb=None, set_run
             ctx.registry.make_bindable(recent_btn, recent_aid)
         if hasattr(ctx, 'tracked_icon_buttons'):
             ctx.tracked_icon_buttons.append((recent_btn, ctx.svgs['recent'], 26))
+            popup_tracked_icon_btns.append(recent_btn)
 
         import_btn = make_popup_icon_btn('import', import_tooltip, import_cb, import_aid)
         export_btn = make_popup_icon_btn('export', export_tooltip, export_cb, export_aid)
@@ -977,9 +1126,16 @@ def show_bot_editor_popup(ctx, parent_editor, run_cb=None, kill_cb=None, set_run
 
             def update_action_icon(running):
                 _running[0] = running
-                svg = ctx.svgs['kill'] if running else ctx.svgs['play']
-                action_btn.setIcon(ctx.titlebar_svg_icon(svg, 22))
-                action_btn.setToolTip(ctx.tl('kill_bot') if running else ctx.tl('run_bot'))
+                if action_btn is None or _cleaned_up[0]:
+                    return
+                try:
+                    if sip.isdeleted(action_btn):
+                        return
+                    svg = ctx.svgs['kill'] if running else ctx.svgs['play']
+                    action_btn.setIcon(ctx.titlebar_svg_icon(svg, 22))
+                    action_btn.setToolTip(ctx.tl('kill_bot') if running else ctx.tl('run_bot'))
+                except (RuntimeError, Exception):
+                    pass
 
             update_action_icon(_running[0])
 
@@ -996,7 +1152,14 @@ def show_bot_editor_popup(ctx, parent_editor, run_cb=None, kill_cb=None, set_run
                 orig_bot_export_set = ctx.exports['bot'].get('set_running')
 
             def synced_set_running(running):
-                update_action_icon(running)
+                if action_btn is not None and not _cleaned_up[0]:
+                    try:
+                        if not sip.isdeleted(action_btn):
+                            update_action_icon(running)
+                        else:
+                            perform_cleanup()
+                    except (RuntimeError, Exception):
+                        perform_cleanup()
                 if orig_bot_export_set:
                     try:
                         orig_bot_export_set(running)
@@ -1134,7 +1297,11 @@ def show_bot_editor_popup(ctx, parent_editor, run_cb=None, kill_cb=None, set_run
     big_editor = CodeEditor(dialog, stroke_color=getattr(ctx, 'stroke_color', '#888888'), show_line_numbers=initial_show_lines)
     if is_console:
         big_editor.setReadOnly(True)
+        if hasattr(parent_editor, 'maximumBlockCount') and parent_editor.maximumBlockCount() > 0:
+            big_editor.document().setMaximumBlockCount(parent_editor.maximumBlockCount())
         big_editor.setPlainText(parent_editor.toPlainText())
+        big_editor.moveCursor(QTextCursor.MoveOperation.End)
+        big_editor.verticalScrollBar().setValue(big_editor.verticalScrollBar().maximum())
     else:
         # Share native QTextDocument for flawless, seamless Undo/Redo (Ctrl+Z / Ctrl+Y)
         big_editor.setDocument(parent_editor.document())
@@ -1311,6 +1478,8 @@ def show_bot_editor_popup(ctx, parent_editor, run_cb=None, kill_cb=None, set_run
         big_editor.setFocus()
 
     find_close_btn.clicked.connect(close_find_replace)
+    dialog.find_replace_widget = find_replace_widget
+    dialog.close_find_replace_fn = close_find_replace
 
     def toggle_find_bar(show_replace=False):
         curr_h = dialog.height()
@@ -1473,11 +1642,31 @@ def show_bot_editor_popup(ctx, parent_editor, run_cb=None, kill_cb=None, set_run
 
     # 2-Way Sync (for read-only console streaming)
     def on_console_parent_changed():
-        if is_console:
-            cursor_at_end = (big_editor.textCursor().position() >= len(big_editor.toPlainText()) - 5)
+        if not is_console or _cleaned_up[0]:
+            return
+        try:
+            if sip.isdeleted(big_editor) or sip.isdeleted(parent_editor):
+                perform_cleanup()
+                return
+
+            sb = big_editor.verticalScrollBar()
+            cursor = big_editor.textCursor()
+            has_selection = cursor.hasSelection()
+            # User is following live logs if scrollbar is near the bottom and hasn't highlighted text
+            at_bottom = (sb.value() >= sb.maximum() - 25)
+            following = at_bottom and not has_selection
+            prev_scroll = sb.value()
+            prev_cursor_pos = cursor.position()
+
             big_editor.setPlainText(parent_editor.toPlainText())
-            if cursor_at_end:
+
+            if following:
                 big_editor.moveCursor(QTextCursor.MoveOperation.End)
+                sb.setValue(sb.maximum())
+            else:
+                sb.setValue(prev_scroll)
+        except (RuntimeError, Exception):
+            perform_cleanup()
 
     if is_console:
         parent_editor.textChanged.connect(on_console_parent_changed)
@@ -1485,42 +1674,50 @@ def show_bot_editor_popup(ctx, parent_editor, run_cb=None, kill_cb=None, set_run
     # Syntax Validation logic (Bot Editor only)
     if not is_combat and not is_console and check_btn is not None:
         def on_validate():
-            if status_card.isVisible():
-                status_card.hide()
+            if _cleaned_up[0]:
                 return
-
-            text = big_editor.toPlainText().strip()
-            if not text:
-                status_card.setStyleSheet(
-                    "background-color: rgba(229, 192, 123, 0.15); color: #e5c07b; "
-                    "border: 1px solid #e5c07b; border-radius: 6px;"
-                )
-                syntax_label.setText("Script is empty.")
-                status_card.show()
-                return
-
             try:
-                from src.deimoslang.vm import VM
-                v = VM({})
-                v.load_from_text(text)
-                status_card.setStyleSheet(
-                    "background-color: rgba(152, 195, 121, 0.15); color: #98c379; "
-                    "border: 1px solid #98c379; border-radius: 6px;"
-                )
-                syntax_label.setText("Valid syntax. No errors found.")
-                status_card.show()
-            except Exception as e:
-                err_msg = str(e).strip()
-                err_msg = err_msg.replace('?', '').strip()
-                status_card.setStyleSheet(
-                    "background-color: rgba(224, 108, 117, 0.15); color: #e06c75; "
-                    "border: 1px solid #e06c75; border-radius: 6px;"
-                )
-                syntax_label.setText(f"Syntax Error: {err_msg}")
-                status_card.show()
+                if status_card is None or sip.isdeleted(status_card) or big_editor is None or sip.isdeleted(big_editor):
+                    return
+                if status_card.isVisible():
+                    status_card.hide()
+                    return
+
+                text = big_editor.toPlainText().strip()
+                if not text:
+                    status_card.setStyleSheet(
+                        "background-color: rgba(229, 192, 123, 0.15); color: #e5c07b; "
+                        "border: 1px solid #e5c07b; border-radius: 6px;"
+                    )
+                    syntax_label.setText("Script is empty.")
+                    status_card.show()
+                    return
+
+                try:
+                    from src.deimoslang.vm import VM
+                    v = VM({})
+                    v.load_from_text(text)
+                    status_card.setStyleSheet(
+                        "background-color: rgba(152, 195, 121, 0.15); color: #98c379; "
+                        "border: 1px solid #98c379; border-radius: 6px;"
+                    )
+                    syntax_label.setText("Valid syntax. No errors found.")
+                    status_card.show()
+                except Exception as e:
+                    err_msg = str(e).strip()
+                    err_msg = err_msg.replace('?', '').strip()
+                    status_card.setStyleSheet(
+                        "background-color: rgba(224, 108, 117, 0.15); color: #e06c75; "
+                        "border: 1px solid #e06c75; border-radius: 6px;"
+                    )
+                    syntax_label.setText(f"Syntax Error: {err_msg}")
+                    status_card.show()
+            except (RuntimeError, Exception):
+                pass
 
         check_btn.clicked.connect(on_validate)
         if hasattr(ctx, 'registry') and ctx.registry and check_aid in ctx.registry.callbacks:
+            orig_validate_cb = ctx.registry.callbacks.get(check_aid)
             ctx.registry.callbacks[check_aid] = on_validate
 
         if hasattr(ctx, 'settings') and ctx.settings:
@@ -1533,27 +1730,13 @@ def show_bot_editor_popup(ctx, parent_editor, run_cb=None, kill_cb=None, set_run
                     except Exception:
                         pass
 
-
-
     def on_close(event):
-        if is_console:
-            try:
-                parent_editor.textChanged.disconnect(on_console_parent_changed)
-            except Exception:
-                pass
-        if not is_combat and not is_console and hasattr(ctx, 'exports') and 'bot' in ctx.exports and orig_bot_export_set:
-            ctx.exports['bot']['set_running'] = orig_bot_export_set
-        if is_console:
-            attr_name = 'console_editor_dialog'
-        elif is_combat:
-            attr_name = 'combat_editor_dialog'
-        else:
-            attr_name = 'bot_editor_dialog'
-        if getattr(ctx, attr_name, None) is dialog:
-            setattr(ctx, attr_name, None)
+        perform_cleanup()
         event.accept()
 
     dialog.closeEvent = on_close
+    dialog.destroyed.connect(lambda *_: perform_cleanup())
+    dialog.finished.connect(lambda *_: perform_cleanup())
 
     for btn in dialog.findChildren(QPushButton):
         btn.setAutoDefault(False)

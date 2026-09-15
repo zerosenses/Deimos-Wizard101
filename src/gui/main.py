@@ -384,6 +384,7 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
     ctx.tracked_icon_buttons.append((toggle_expand_btn, svgs['expand'], 32))
 
     console_psg = PyQtSink(console_text)
+    ctx.console_psg = console_psg
 
     def _toggle_expand_logs():
         _logs_expanded[0] = not _logs_expanded[0]
@@ -416,7 +417,8 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
         ctx.console_editor_dialog = show_bot_editor_popup(
             ctx, console_text, mode='console',
             toggle_logs_cb=_toggle_expand_logs,
-            initial_logs_expanded=True
+            initial_logs_expanded=True,
+            copy_logs_cb=console_psg.copy
         )
 
         # When the expanded window is closed, revert the main console tab back
@@ -425,12 +427,16 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
         if _dialog is not None:
             _orig_close_event = _dialog.closeEvent
             def _on_console_popup_close(event):
+                if _orig_close_event:
+                    try:
+                        _orig_close_event(event)
+                    except Exception:
+                        pass
                 try:
                     if _logs_expanded[0]:
                         _toggle_expand_logs()
                 except Exception:
                     pass
-                _orig_close_event(event)
             _dialog.closeEvent = _on_console_popup_close
 
     toggle_expand_btn.clicked.disconnect()
@@ -621,9 +627,15 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
                             else:
                                 duel_circle.set_slot_info(value)
                         elif tag == 'FlythroughStatus':
-                            flythrough_exports.get('set_running', lambda v: None)(value == 'Enabled')
+                            try:
+                                flythrough_exports.get('set_running', lambda v: None)(value == 'Enabled')
+                            except Exception:
+                                pass
                         elif tag == 'BotStatus':
-                            bot_exports.get('set_running', lambda v: None)(value == 'Enabled')
+                            try:
+                                bot_exports.get('set_running', lambda v: None)(value == 'Enabled')
+                            except Exception:
+                                pass
                         else:
                             widget = widget_tags.get(tag)
                             if widget is not None:
