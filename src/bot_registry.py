@@ -54,8 +54,16 @@ def _get_registry_json(url: str):
     return resp.json()
 
 
+def _zone_folder(zone: str) -> str:
+    """Translate an in-game zone ID to its folder under bots/."""
+    clean = (zone or '').strip('/')
+    if clean.startswith('Housing_'):
+        return f'Housing/{clean}'
+    return clean
+
+
 def _zone_registry_url(zone: str) -> str:
-    return f'{registry_raw_base}/bots/{quote(zone, safe="/")}/registry.json'
+    return f'{registry_raw_base}/bots/{quote(_zone_folder(zone), safe="/")}/registry.json'
 
 
 def _is_general(bot: dict) -> bool:
@@ -67,7 +75,10 @@ def _ancestor_zones(zone: str) -> list[str]:
     if not zone:
         return []
     parts = zone.strip('/').split('/')
-    return ['/'.join(parts[:i]) for i in range(len(parts), 0, -1)]
+    ancestors = ['/'.join(parts[:i]) for i in range(len(parts), 0, -1)]
+    if zone.startswith('Housing_') and 'Housing' not in ancestors:
+        ancestors.append('Housing')
+    return ancestors
 
 
 def search_compatible_bots(zone: str, client_count) -> list[dict]:
@@ -244,7 +255,8 @@ def bot_repo_path(zone: str, name: str) -> str:
     """Repo-relative path a published bot should live at, e.g. bots/<zone>/<Name>.txt."""
     clean_zones = [z.strip() for z in (zone or '').split(',') if z.strip()]
     primary_zone = clean_zones[0].strip('/') if clean_zones else ''
-    return f"bots/{primary_zone}/{sanitize_bot_filename(name)}"
+    folder = _zone_folder(primary_zone)
+    return f"bots/{folder}/{sanitize_bot_filename(name)}"
 
 
 def build_publish_url(zone: str, name: str, content: str) -> str:
